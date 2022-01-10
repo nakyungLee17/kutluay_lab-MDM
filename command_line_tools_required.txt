@@ -1,0 +1,4 @@
+STAR
+samtools
+bedtools
+featureCounts

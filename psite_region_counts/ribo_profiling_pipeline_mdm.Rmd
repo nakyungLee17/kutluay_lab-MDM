@@ -1,0 +1,286 @@
+---
+title: "Ribosome profiling analysis pipeline"
+author: "Yating Liu and NaKyung Lee"
+date: "10/2/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# to test run: sample input files are in the "sample" folder
+knitr::opts_knit$set(root.dir = "/path/to/sample")
+
+library(tidyverse)
+library(edgeR)
+library(biomaRt)
+library(RColorBrewer)
+library(gridExtra)
+library(genefilter)
+
+save_figs <- T
+options(stringsAsFactors = F, readr.show_types = F)
+source("/path/to/ribo_profiling_functions_mdm.R")
+```
+
+
+> Required input files include count files from RNAseq and Riboseq, of two conditions, with replicates labeled as "repN". The count files need to be placed in a folder called "htseq_count_cds".
+
+> "samples.csv" describes the names, replicates, conditions, and experiment types of the count files. Samples need to be ordered in a similar way as in "samples.csv" in "sample" folder.
+
+> Input count files should be named in the same way as the sample names in the "sample" column of samples.csv, with ".count_reduced " at the end. Please refer to "sample" folder for example.
+
+### Specify the relative output directory and create necessary folders
+```{r}
+## global variable: relative path of the output folder 
+OUTPUT <- "exp1_results"
+## global variable: group of samples 
+SAMPLES <- c("rep1_mock", "rep1_IFN30m", "rep2_mock", "rep2_IFN30m") # <<< change according to sample names of count files (omit "rseq/ribo" information)
+
+make_output_directories(OUTPUT)
+
+## check dependency: need a samples.csv file to describe replicates, treatments and etc for each sample in the current root dir
+if (!file.exists("samples.csv")) {
+  stop("samples.csv doesn't exist!")
+}
+```
+
+### Make DGE objects from Ribo-seq and RNA-seq gene counts
+
+> Move the "htseq_count_cds" folder to OUTPUT folder "exp1_results"
+
+```{r}
+if (!dir.exists(file.path(OUTPUT, "htseq_count_cds"))) {
+  stop("HTseq-count results for CDS doesn't exist!")
+}
+
+# Make DGE object for all samples
+make_dge(file.path(OUTPUT, "htseq_count_cds"), "", region = "cds")
+
+```
+
+### Read in cpm table and dge object
+```{r}
+all_cpm <- read_csv(file.path(OUTPUT, "reports","cpm_cds.csv"))
+dge_all <- readRDS(file.path(OUTPUT, "objs", "dge_cds_protein_coding.rds"))
+```
+
+### Filtering
+```{r}
+filter_dge(dge_all, "cds", ribothreshold = 1, rseqthreshold = 1)
+dge_all_filt <- readRDS("exp1_results/objs/dge_cds_filt_norm.rds")
+all_cpm_filt <- read_csv("exp1_results/reports/cpm_cds_filt.csv")
+```
+
+
+### Generate cds GTF, utr3 GTF and utr5 GTF 
+
+```{r, eval=T}
+
+ensembl = useMart(biomart = "ENSEMBL_MART_ENSEMBL", version = "Ensembl Genes 75", dataset = "hsapiens_gene_ensembl", host = "http://feb2014.archive.ensembl.org") # human
+
+
+filtered_genes_ens <- getBM(attributes=c('ensembl_gene_id','ensembl_transcript_id', 'chromosome_name', 'strand', 'external_gene_id', '5_utr_start', '5_utr_end', '3_utr_start', '3_utr_end', 'genomic_coding_start', 'genomic_coding_end'), filters = 'ensembl_gene_id', values = all_cpm_filt$ensembl_gene_id, mart = ensembl) # human
+
+
+cds_regions <- filtered_genes_ens %>% 
+  filter(!is.na(genomic_coding_start) & !is.na(genomic_coding_end)) %>% 
+  transmute(chr = chromosome_name, source="protein_coding", method="CDS", start=genomic_coding_start, end=genomic_coding_end, score=".", 
+            strand=case_when(strand == -1 ~ "-",
+                             strand == 1 ~ "+"), 
+            phase=".",
+            group = paste0('gene_id "', ensembl_gene_id, '"; ', 'transcript_id "', ensembl_transcript_id, '"; ', ' gene_name "', external_gene_id, '";')) %>% 
+  arrange(chr, start, end)
+write.table(cds_regions, file.path(OUTPUT, "cds_regions.gtf"), col.names = F, row.names = F, quote = F, sep = "\t")
+
+
+utr5_annotation <- filtered_genes_ens %>% 
+  filter(!is.na(`5_utr_start`) & !is.na(`5_utr_end`)) %>% 
+  transmute(chr = chromosome_name, source="protein_coding", method="UTR5", start=`5_utr_start`, end=`5_utr_end`, score=".", 
+            strand=case_when(strand == -1 ~ "-",
+                             strand == 1 ~ "+"), 
+            phase=".",
+            group = paste0('gene_id "', ensembl_gene_id, '"; ', 'transcript_id "', ensembl_transcript_id, '"; ', ' gene_name "', external_gene_id, '";')) %>% 
+  arrange(chr, start, end)
+write.table(utr5_annotation,file.path(OUTPUT, "utr5_annotation.gtf"), col.names = F, row.names = F, quote = F, sep = "\t")
+
+
+utr3_annotation <- filtered_genes_ens %>% 
+  filter(!is.na(`3_utr_start`) & !is.na(`3_utr_end`)) %>% 
+  transmute(chr = chromosome_name, source="protein_coding", method="UTR3", start=`3_utr_start`, end=`3_utr_end`, score=".", 
+            strand=case_when(strand == -1 ~ "-",
+                             strand == 1 ~ "+"), 
+            phase=".",
+            group = paste0('gene_id "', ensembl_gene_id, '"; ', 'transcript_id "', ensembl_transcript_id, '"; ', ' gene_name "', external_gene_id, '";')) %>%
+  arrange(chr, start, end)
+write.table(utr3_annotation, file.path(OUTPUT, "utr3_annotation.gtf"), col.names = F, row.names = F, quote = F, sep = "\t")
+
+```
+
+### Remove the UTR regions overlapped with CDS, and remove the regions overlapped with repeats, then use featureCounts to count reads within cds, 3', or 5'
+
+> download hg19 repeat masker track in GTF format from UCSC and then edit the chromosome names (by removing "chr") to be consist with Ensembl
+
+hg19RepMasker_removed_chr.gtf
+
+> Use bedtools subtract to remove utr3 and utr5 regions overlapped with cds and remove repeat regions
+
+# refer to run_utr_cleaning_mdm.sh script
+
+> Use featureCounts to count reads in cds, utr3, and utr5 with the cleaned annotation files
+
+To count reads in cds, utr5, and utr3, the sorted alignment BAM files for all samples used in this pipeline are used as input, the respective gtf files are used in the -a option, and "CDS", "UTR5", and "UTR3" are used in the -t option (feature type). Other common parameters are: -g gene_id, --fracOverlap 1, and --minOverlap 1.
+
+example featureCounts command:
+featureCounts -t UTR3 -g gene_id -a utr3_annotation.gtf -o 'utr3_ribo_rep1_mock.count' --fracOverlap 1 --minOverlap 1 ribo_rep1_mock_aligned_sorted.bam
+
+
+Select only the 1st and 7th columns from the count files, namely Geneid and count, without header lines, to make the reduced count files. 
+
+
+
+### Genomic region count tables
+
+> Copy the newly generated reduced count files (CDS, UTR3, and UTR5) to a folder named "combined_counts" in OUTPUT. The naming convention for the new count files is "[cds/utr5/utr3]_[sample name].count_reduced".
+
+> Example count file name: utr3_ribo_rep1_mock.count_reduced
+
+
+## Create counts table with all samples
+```{r}
+dir.create(file.path(OUTPUT, "reports", "count_tables"), recursive = T)
+samples <- read_csv("samples.csv")
+
+counts_path <- file.path(OUTPUT, "combined_counts")
+files <- dir(path = counts_path, pattern = "*.count_reduced$")
+
+## sort files - asc
+files <- sort(files)
+counts <- readDGE(files, path = counts_path, header = F)$counts
+stopifnot(length(unique(rownames(counts))) == nrow(counts))
+
+## get gene info
+ensembl = useMart(biomart = "ENSEMBL_MART_ENSEMBL", version = "Ensembl Genes 75", dataset = "hsapiens_gene_ensembl", host = "http://feb2014.archive.ensembl.org") # human
+
+gtf.ens <- getBM(attributes = c('ensembl_gene_id', 'external_gene_id', "gene_biotype"),filters = 'ensembl_gene_id', values = rownames(counts), mart = ensembl) # human
+
+
+saveRDS(gtf.ens, file.path(file.path(OUTPUT, "objs"), paste0("all", "_genes.rds")))
+
+genes <- readRDS(file.path(file.path(OUTPUT, "objs"), paste0("all", "_genes.rds")))
+genes <- genes[match(rownames(counts), genes$ensembl_gene_id), ]
+genes <- na.omit(genes)
+
+print(paste0("no. genes in count: ", nrow(counts)), quote = F)
+counts <- counts[genes$ensembl_gene_id, ]
+print(paste0("no. genes in count and also biomart: ", nrow(counts)), quote = F)
+
+stopifnot(genes$ensembl_gene_id == rownames(counts))
+
+write.csv(counts, file.path(file.path(OUTPUT, "reports"), paste0("raw_counts_combined", ".csv")))
+
+```
+
+## Working with counts table
+```{r}
+
+# total counts for each sample (cds, utr3, utr5)
+sums <- colSums(counts)
+
+# var1 and var2 are two conditions, in this case, mock and IFN.
+var1 <- unique(samples$independent_var)[1]
+var2 <- unique(samples$independent_var)[2]
+
+# region_dist() transforms a vector of total counts into a table, whose columns are samples and whose rows are cds, utr3, and utr5. This table describes for each sample, how many reads are counted towards cds region, utr3 region, and utr5 region.
+region_dist <- function(var) {
+  table_var <- sums[grepl(var, names(sums))]
+  table_var <- matrix(table_var, ncol = nrow(samples) / 2, byrow = T)
+  
+  reps <- levels(factor(samples$experiment))
+  experiment_names <- paste0("Ribo_", reps)
+  experiment_names <- append(experiment_names, paste0("Rseq_", reps))
+  
+  colnames(table_var) <- experiment_names
+  rownames(table_var) <- c("cds","utr3","utr5")
+  
+  write.csv(table_var, file.path(OUTPUT, "reports", "count_tables", paste0("table_", var, ".csv")))
+}
+
+region_dist(var1) # one table for each condition
+region_dist(var2)
+
+```
+
+
+
+### Ribosome trinucleotide periodicity analysis using riboWaltz
+
+## Get P site information
+
+> Copy ribosome profiling transcriptome alignment BAM files to a folder named "transcriptome_bams" in OUTPUT. Rename the filenames to "[sample name]_rf.bam"
+
+* s1_Aligned.toTranscriptome.out.bam -> rep1_mock_rf.bam
+* s2_Aligned.toTranscriptome.out.bam -> rep1_IFN30m_rf.bam
+* s3_Aligned.toTranscriptome.out.bam -> rep2_mock_rf.bam
+* s4_Aligned.toTranscriptome.out.bam -> rep2_IFN30m_rf.bam
+
+
+```{r}
+# note: this chunk may take around 20 mins to run.
+
+library(riboWaltz)
+require(riboWaltz)
+
+# use GRCh37 annotation file
+annotation <- create_annotation(gtfpath = "/path/to/GRCh37.87.gtf") # human
+
+reads_list <- bamtolist(bamfolder = file.path(OUTPUT, "transcriptome_bams"), annotation = annotation)
+
+reads_list_filter <- length_filter(data = reads_list, length_filter_mode = "custom", length_range = 27:34) # <<< change length range according to the samples' read length distribution
+
+psite_offset <- psite(reads_list_filter, flanking = 6, extremity = "auto")
+
+reads_psite_list <- psite_info(reads_list_filter, psite_offset)
+
+```
+
+## P-site frames
+```{r}
+# generates a bar plot showing the percentage of P-sites falling in the three possible translation reading frames for 5’ UTRs, CDSs and 3’ UTRs.
+
+for (sample in SAMPLES) {
+  example_frames <- frame_psite(reads_psite_list,sample = paste0(sample, "_rf"), region = "all")
+
+  pt <- example_frames[["plot"]] +
+    labs(title = sample)
+  if (save_figs) ggsave(filename = paste0(OUTPUT, "/reports", "/figs/", sample, "_rf_frame_psite.png"), plot = pt)
+  print(pt)
+}
+```
+
+## P-site frames - Heatmap
+```{r}
+# similar to frame_psite(), but evaluates each read length separately.
+
+example_frames_heat <- frame_psite_length(reads_psite_list, region = "all")
+
+pt <- example_frames_heat[["plot"]]
+pt <- pt + theme(strip.text.y = element_text(size = 10))
+if (save_figs) ggsave(filename = paste0(OUTPUT, "/reports", "/figs/", "frame_psite_heatmap.pdf"), plot = pt)
+print(pt)
+```
+
+## P-site metaprofile
+```{r}
+# generates metaprofiles (the merge of single, transcript-specific profiles) based on P-sites mapping around the start and the stop codon of annotated CDSs.
+
+for (sample in SAMPLES) {
+  example_metaprofile <- metaprofile_psite(reads_psite_list, annotation, sample = paste0(sample, "_rf"), utr5l = 25, cdsl =50, utr3l = 25, plot_title = "sample.transcript")
+  pt <- example_metaprofile[[paste0("plot_", sample, "_rf")]]
+
+  pt <- pt + theme(plot.title = element_text(size = 20), strip.text.x = element_text(size=15))
+  if (save_figs) ggsave(file.path(file.path(OUTPUT, "reports", "figs"), paste0(sample, "_rf_metaprofile_psite.png")), plot = pt, width = 10, height = 6)
+  print(pt)
+}
+```
+
+

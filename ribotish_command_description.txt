@@ -1,0 +1,6 @@
+Ribo-TISH quality function was run to assess the trinucleotide periodicity of separate read lengths. GRCh37 gene annotation file was used. 
+
+Other parameters specified were: 
+-l 25,36
+-nom0
+--th 0.4

@@ -1,0 +1,9 @@
+sample,experiment,independent_var,experiment_type
+ribo_rep1_mock,rep1,mock,riboseq
+ribo_rep1_IFN30m,rep1,IFN30m,riboseq
+ribo_rep2_mock,rep2,mock,riboseq
+ribo_rep2_IFN30m,rep2,IFN30m,riboseq
+rseq_rep1_mock,rep1,mock,rnaseq
+rseq_rep1_IFN30m,rep1,IFN30m,rnaseq
+rseq_rep2_mock,rep2,mock,rnaseq
+rseq_rep2_IFN30m,rep2,IFN30m,rnaseq
